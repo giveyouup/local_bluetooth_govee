@@ -223,6 +223,8 @@ class GoveeBLECoordinator(_DreamviewMixin, _ActiveModeMixin):
         self._client: BleakClient | None = None
         self._encryption: GoveeEncryptionSession | None = None
         self._advertised_encryption = False
+        # A parsed Govee advertisement explicitly cleared the encryption flag.
+        self._advertised_plaintext = False
         self._connection_initializing = False
         self._notification_token: object | None = None
         self._upload_ack: tuple[BleakClient, object | None, int, int, asyncio.Future[bool]] | None = None
@@ -951,6 +953,8 @@ class GoveeBLECoordinator(_DreamviewMixin, _ActiveModeMixin):
             if advertisement is not None:
                 self.pact_type, self.pact_code = advertisement.pact_type, advertisement.pact_code
                 self._resolve_device_profile()
+            if advertisement is not None and not advertisement.supports_encryption:
+                self._advertised_plaintext = True
             if advertisement is not None and advertisement.supports_encryption:
                 self._advertised_encryption = True
                 if self._encryption is not None and self._encryption.version == 0:
@@ -1134,7 +1138,11 @@ class GoveeBLECoordinator(_DreamviewMixin, _ActiveModeMixin):
                 use_services_cache=not force_fresh_services,
             )
             self._reset_disconnect_timer()
-            await self._encryption.async_select(client, advertised=self._advertised_encryption)
+            await self._encryption.async_select(
+                client,
+                advertised=self._advertised_encryption,
+                plaintext_evidence=self._advertised_plaintext and not self._advertised_encryption,
+            )
             if self._client is not client or not client.is_connected:
                 raise GoveeCryptoError("disconnected_during_selection")
             if self.profile.requires_notifications or self._encryption.version:

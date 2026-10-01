@@ -165,6 +165,85 @@ async def test_read_failure_has_no_raw_error_or_fallback():
     assert not session.ready
 
 
+UNRECOGNISED_MARKERS = [b"", b"\x01", b"\x02\x02", b"\x02\0", b"\x03\x01", b"\x01\x03", "not bytes"]
+
+
+@pytest.mark.parametrize("marker", [*UNRECOGNISED_MARKERS, RuntimeError("secret address/key payload")])
+async def test_unrecognised_marker_with_plaintext_advertisement_selects_plaintext(marker):
+    # Issue #310: H6102 HW 1.00.03 / FW 1.08.08 advertises ec 00 01 01 (encryption bit clear).
+    session, device = GoveeEncryptionSession(), client(b"\x01\x01")
+    device.services[0].characteristics[0].properties = ["write", "notify"]
+    if isinstance(marker, Exception):
+        device.read_gatt_char.side_effect = marker
+    else:
+        device.read_gatt_char.return_value = marker
+    await session.async_select(device, advertised=False, plaintext_evidence=True)
+    assert session.ready and session.version == 0
+    assert session.last_result == "plaintext_unrecognised_marker"
+    await session.async_negotiate(device)
+    assert session.encode(build_power(True)) == build_power(True)
+    device.write_gatt_char.assert_not_awaited()
+    observation = session.diagnostics()["marker_observation"]
+    assert observation["properties"] == ["notify", "write"]
+    assert observation["services"] == [
+        {"uuid": "", "characteristics": [{"uuid": ENCRYPTION_UUID, "properties": ["notify", "write"]}]}
+    ]
+    assert observation["error"] in {"GoveeCryptoError", "RuntimeError"}
+    assert observation["marker"] == (marker.hex() if isinstance(marker, bytes) else None)
+    assert "secret" not in json.dumps(session.diagnostics())
+
+
+@pytest.mark.parametrize("marker", UNRECOGNISED_MARKERS)
+async def test_plaintext_advertisement_never_overrides_encryption_evidence(marker):
+    advertised = GoveeEncryptionSession()
+    with pytest.raises(GoveeCryptoError, match="selection_failed"):
+        await advertised.async_select(client(marker), advertised=True, plaintext_evidence=True)
+    assert not advertised.ready
+
+    previously_encrypted = GoveeEncryptionSession()
+    await previously_encrypted.async_select(client(b"\x01\x01"), advertised=False, plaintext_evidence=True)
+    with pytest.raises(GoveeCryptoError, match="selection_failed"):
+        await previously_encrypted.async_select(client(marker), advertised=False, plaintext_evidence=True)
+    assert not previously_encrypted.ready
+
+
+@pytest.mark.parametrize("marker,version", [(b"\x01\x01", 1), (b"\x01\x02", 2), (b"\x02\x01\0\x01\x02\x03", 1)])
+async def test_recognised_marker_outranks_plaintext_advertisement(marker, version):
+    session = GoveeEncryptionSession()
+    await session.async_select(client(marker), advertised=False, plaintext_evidence=True)
+    assert session.version == version and not session.ready
+    assert session.diagnostics()["marker_observation"]["marker"] == marker.hex()
+
+
+def test_plaintext_advertisement_evidence(hass):
+    coordinator = GoveeBLECoordinator(hass, "11:22:33:44:55:66", "H6102", configuration_url=None)
+    for data in ({}, {0x8801: b"\xec"}):
+        coordinator._note_advertisement(SimpleNamespace(manufacturer_data=data))
+        assert not coordinator._advertised_plaintext
+    coordinator._note_advertisement(SimpleNamespace(manufacturer_data={0x8801: bytes.fromhex("ec000101")}))
+    assert coordinator._advertised_plaintext and not coordinator._advertised_encryption
+    assert (coordinator.pact_type, coordinator.pact_code) == (1, 1)
+    coordinator._note_advertisement(SimpleNamespace(manufacturer_data={0x8843: bytes.fromhex("ec010203")}))
+    assert coordinator._advertised_encryption
+
+
+async def test_coordinator_connects_plaintext_with_unreadable_marker(hass):
+    coordinator = GoveeBLECoordinator(hass, "11:22:33:44:55:66", "H6076", configuration_url=None)
+    coordinator.profile = replace(
+        coordinator.profile, read_domains=frozenset(), setup_required_read_domains=frozenset()
+    )
+    device = client(b"\x01\x01")
+    device.read_gatt_char.side_effect = BleakError("Not permitted")
+    with patch(f"{M}.async_establish_ble_connection", return_value=device):
+        with pytest.raises(GoveeCryptoError, match="encryption_selection_failed"):
+            await coordinator.send_command(build_power(True, "H6076"))
+        device.write_gatt_char.assert_not_awaited()
+        coordinator._note_advertisement(SimpleNamespace(manufacturer_data={0x8801: bytes.fromhex("ec000101")}))
+        await coordinator.send_command(build_power(True, "H6076"))
+    assert coordinator._encryption.last_result == "plaintext_unrecognised_marker"
+    device.write_gatt_char.assert_awaited_with(WRITE_UUID, build_power(True, "H6076"), response=False)
+
+
 def test_advertisement_and_omissions(hass):
     positive = {0x8843: bytes.fromhex("ec010203")}
     assert parse_govee_advertisement(positive).supports_encryption

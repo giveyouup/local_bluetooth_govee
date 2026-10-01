@@ -1,6 +1,7 @@
 """Evidence-selected, fail-closed encryption for one BLE connection at a time."""
 
 import asyncio
+import logging
 import os
 import warnings
 from typing import Any
@@ -20,6 +21,28 @@ from . import (
 )
 
 HANDSHAKE_TIMEOUT = 6.0  # EncryptionManager: both key and confirmation waits.
+_MARKER_OBSERVATION_LIMIT = 32
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _marker_observation(client: Any, characteristic: Any) -> dict[str, Any]:
+    """Describe GATT layout and marker properties; addresses and payloads stay out."""
+    return {
+        "properties": sorted(str(p) for p in getattr(characteristic, "properties", ()) or ()),
+        "services": [
+            {
+                "uuid": str(getattr(service, "uuid", "")),
+                "characteristics": [
+                    {"uuid": str(c.uuid), "properties": sorted(str(p) for p in getattr(c, "properties", ()) or ())}
+                    for c in service.characteristics
+                ],
+            }
+            for service in client.services
+        ],
+        "marker": None,
+        "error": None,
+    }
 
 
 class GoveeEncryptionSession:
@@ -29,6 +52,7 @@ class GoveeEncryptionSession:
         self._selection_failed = False
         self.ready = False
         self.last_result = "not_selected"
+        self.marker_observation: dict[str, Any] | None = None
         self.rejected_frames = 0
         self._handshake: asyncio.Future[Any] | None = None
         self._opcode = 0
@@ -56,12 +80,13 @@ class GoveeEncryptionSession:
         self._counter, self._received_counter = 2, 0
         self._mtu = 0
 
-    async def async_select(self, client: Any, *, advertised: bool) -> None:
+    async def async_select(self, client: Any, *, advertised: bool, plaintext_evidence: bool = False) -> None:
         self.reset()
         generation = self._generation
         self.version = 0
         if advertised and not self.required_version:
             self.required_version = 1
+        self.marker_observation = None
         try:
             # Enumerate discovered services: absence alone never causes a read or probe.
             characteristic = next(
@@ -72,12 +97,34 @@ class GoveeEncryptionSession:
                     raise GoveeCryptoError("previous_selection_failed")
                 self.version = self.required_version or (1 if advertised else 0)
             else:
-                data = await client.read_gatt_char(ENCRYPTION_UUID)
-                if not isinstance(data, (bytes, bytearray)):
-                    raise GoveeCryptoError("invalid_marker")
-                marker = parse_wire("Marker", bytes(data))
-                if marker.format not in (1, 2) or marker.version not in (0, 1, 2):
-                    raise GoveeCryptoError("invalid_marker")
+                observation = self.marker_observation = _marker_observation(client, characteristic)
+                try:
+                    data = await client.read_gatt_char(ENCRYPTION_UUID)
+                    if not isinstance(data, (bytes, bytearray)):
+                        raise GoveeCryptoError("invalid_marker")
+                    observation["marker"] = bytes(data[:_MARKER_OBSERVATION_LIMIT]).hex()
+                    marker = parse_wire("Marker", bytes(data))
+                    if marker.format not in (1, 2) or marker.version not in (0, 1, 2):
+                        raise GoveeCryptoError("invalid_marker")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    # Exception text can carry backend payloads; record only its type.
+                    observation["error"] = type(err).__name__
+                    _LOGGER.debug("Unrecognised encryption marker: %s", observation)
+                    if not plaintext_evidence or advertised or self.required_version:
+                        raise
+                    # A Govee advertisement explicitly clears the encryption flag and
+                    # nothing selected encryption before: an unreadable marker is not
+                    # positive evidence, so plaintext matches the device's own claim.
+                    if generation != self._generation or not client.is_connected:
+                        raise GoveeCryptoError("session_reset") from None
+                    self.version = 0
+                    self._selection_failed = False
+                    self.ready = True
+                    self.last_result = "plaintext_unrecognised_marker"
+                    return
+                _LOGGER.debug("Encryption marker: %s", observation)
                 # Version zero permits plaintext only without positive encryption evidence.
                 self.version = marker.version or self.required_version
                 self._selection_failed = False
@@ -218,4 +265,5 @@ class GoveeEncryptionSession:
             "version": self.version,
             "last_result": self.last_result,
             "rejected_frames": self.rejected_frames,
+            "marker_observation": self.marker_observation,
         }
